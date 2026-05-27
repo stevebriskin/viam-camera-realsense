@@ -1309,24 +1309,146 @@ private:
           return true;
         }
 
-        // Normal device initialization with streaming support
-        VIAM_RESOURCE_LOG(info)
-            << "[assign_and_initialize_device] calling createDevice for: "
-            << connected_device_serial_number;
-        realsense::RsResourceConfig config_copy = config_.get();
-        device_ = device_funcs_.createDevice(connected_device_serial_number,
-                                             dev_ptr, SUPPORTED_CAMERA_MODELS,
-                                             config_copy, this->logger_);
-        BOOST_ASSERT(device_ != nullptr);
+        // Normal device initialization with streaming support.
+        // On macOS the librealsense USB backend intermittently fails control
+        // transfers during init (get_stream_profiles inside createDevice,
+        // pipe.start inside startDevice) with "failed to set power state". Each
+        // attempt builds a fresh device wrapper (new pipe/config) and retries
+        // with backoff. Linux is unaffected, so it uses a single attempt.
+#if defined(__APPLE__)
+        constexpr int kDeviceInitAttempts = 5;
+#else
+        constexpr int kDeviceInitAttempts = 1;
+#endif
+        enum class InitResult { Success, Transient, Permanent };
 
-        VIAM_RESOURCE_LOG(info)
-            << "[assign_and_initialize_device] calling startDevice for: "
-            << connected_device_serial_number;
-        device_funcs_.startDevice(connected_device_serial_number, device_,
-                                  latest_frameset_, MAX_FRAME_AGE_MS,
-                                  config_copy, this->logger_);
+        // One create+start round. Sets device_ on success; leaves it null
+        // otherwise. Transient = retryable USB error; Permanent = unsupported
+        // model / no usable config (retrying won't help).
+        auto attempt_init = [&](auto &handle_ptr) -> InitResult {
+          try {
+            realsense::RsResourceConfig config_copy = config_.get();
+            device_ = device_funcs_.createDevice(
+                connected_device_serial_number, handle_ptr,
+                SUPPORTED_CAMERA_MODELS, config_copy, this->logger_);
+            if (device_ == nullptr) {
+              VIAM_RESOURCE_LOG(error)
+                  << "[assign_and_initialize_device] createDevice returned null "
+                     "for "
+                  << connected_device_serial_number << ", skipping device";
+              return InitResult::Permanent;
+            }
+            device_funcs_.startDevice(connected_device_serial_number, device_,
+                                      latest_frameset_, MAX_FRAME_AGE_MS,
+                                      config_copy, this->logger_);
+            return InitResult::Success;
+          } catch (const std::exception &e) {
+            VIAM_RESOURCE_LOG(warn)
+                << "[assign_and_initialize_device] init attempt for "
+                << connected_device_serial_number << " failed: " << e.what();
+            // Drop the half-built wrapper so the next attempt starts clean.
+            device_ = nullptr;
+            return InitResult::Transient;
+          }
+        };
+
+        auto run_attempts = [&](auto &handle_ptr) -> InitResult {
+          InitResult last = InitResult::Transient;
+          for (int attempt = 1; attempt <= kDeviceInitAttempts; ++attempt) {
+            VIAM_RESOURCE_LOG(info)
+                << "[assign_and_initialize_device] initializing "
+                << connected_device_serial_number << " (attempt " << attempt
+                << "/" << kDeviceInitAttempts << ")";
+            last = attempt_init(handle_ptr);
+            if (last != InitResult::Transient) {
+              return last;
+            }
+            if (attempt < kDeviceInitAttempts) {
+              std::this_thread::sleep_for(
+                  std::chrono::milliseconds(200 * attempt));
+            }
+          }
+          return last;
+        };
+
+        InitResult result = run_attempts(dev_ptr);
+
+#if defined(__APPLE__)
+        // Last-resort recovery: the macOS USB backend can wedge a device so
+        // that every control transfer fails ("failed to set power state") and
+        // ordinary retries can't clear it. Power-cycle the camera over USB,
+        // wait for it to re-enumerate, then make one more set of attempts on a
+        // fresh handle. hardware_reset is itself a control transfer, so it may
+        // also fail on a badly wedged device — in that case we give up and the
+        // outer catch moves on.
+        if (result == InitResult::Transient) {
+          VIAM_RESOURCE_LOG(warn)
+              << "[assign_and_initialize_device] "
+              << connected_device_serial_number << " still failing after "
+              << kDeviceInitAttempts
+              << " attempts; issuing USB hardware_reset and waiting for "
+                 "re-enumeration";
+          bool reset_ok = false;
+          try {
+            dev_ptr->hardware_reset();
+            reset_ok = true;
+          } catch (const std::exception &e) {
+            VIAM_RESOURCE_LOG(error)
+                << "[assign_and_initialize_device] hardware_reset failed for "
+                << connected_device_serial_number << ": " << e.what();
+          }
+
+          if (reset_ok) {
+            constexpr int kReenumTimeoutMs = 10000;
+            constexpr int kReenumPollMs = 500;
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(kReenumTimeoutMs);
+            bool reacquired = false;
+            while (not reacquired &&
+                   std::chrono::steady_clock::now() < deadline) {
+              std::this_thread::sleep_for(
+                  std::chrono::milliseconds(kReenumPollMs));
+              auto fresh_list = realsense_ctx_->query_devices();
+              for (int j = 0; j < static_cast<int>(fresh_list.size()); ++j) {
+                auto fresh_dev = fresh_list[j];
+                if (not fresh_dev.supports(RS2_CAMERA_INFO_SERIAL_NUMBER)) {
+                  continue;
+                }
+                if (connected_device_serial_number ==
+                    std::string(
+                        fresh_dev.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER))) {
+                  VIAM_RESOURCE_LOG(info)
+                      << "[assign_and_initialize_device] "
+                      << connected_device_serial_number
+                      << " re-enumerated after reset; retrying init";
+                  auto fresh_ptr =
+                      std::make_shared<std::decay_t<decltype(fresh_dev)>>(
+                          fresh_dev);
+                  result = run_attempts(fresh_ptr);
+                  reacquired = true;
+                  break;
+                }
+              }
+            }
+            if (not reacquired) {
+              VIAM_RESOURCE_LOG(error)
+                  << "[assign_and_initialize_device] "
+                  << connected_device_serial_number
+                  << " did not re-enumerate within " << kReenumTimeoutMs
+                  << "ms after hardware_reset";
+            }
+          }
+        }
+#endif
+
+        if (result != InitResult::Success) {
+          // Hand off to the outer catch, which logs and tries the next device.
+          throw std::runtime_error("failed to initialize device " +
+                                   connected_device_serial_number +
+                                   " after retries");
+        }
+
         physical_camera_assigned_ = true;
-        is_recovery_mode_ = false;
         is_recovery_mode_ = false;
         return true;
       } catch (const std::exception &e) {

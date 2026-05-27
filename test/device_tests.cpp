@@ -1000,11 +1000,18 @@ TEST_F(DeviceTest, DisableAutoExposurePriority_ColorSensor_DisablesOption) {
   MockSensor mock_sensor;
   mock_sensor.set_sensor_type(true, false); // Color sensor
 
+#if defined(__APPLE__)
+  // macOS skips the set_option path entirely (see device_impl.hpp) — the
+  // sensor is never queried or written.
+  EXPECT_CALL(mock_sensor, supports(_)).Times(0);
+  EXPECT_CALL(mock_sensor, set_option(_, _)).Times(0);
+#else
   // Setup expectations - color sensor supports auto-exposure priority
   EXPECT_CALL(mock_sensor, supports(RS2_OPTION_AUTO_EXPOSURE_PRIORITY))
       .WillOnce(Return(true));
   EXPECT_CALL(mock_sensor, set_option(RS2_OPTION_AUTO_EXPOSURE_PRIORITY, 0.0))
       .Times(1);
+#endif
 
   // Execute
   disableAutoExposurePriority(mock_sensor, logger);
@@ -1013,18 +1020,30 @@ TEST_F(DeviceTest, DisableAutoExposurePriority_ColorSensor_DisablesOption) {
   auto all_logs = log_capture.get_records();
   EXPECT_GT(all_logs.size(), 0) << "Should log info message";
 
-  // Verify the log contains success message
-  bool found_disabled_msg = false;
+  // Verify the log contains the message expected for this platform
+  bool found_expected_msg = false;
   for (const auto &log : all_logs) {
+#if defined(__APPLE__)
+    if (log.message.find("Skipped on macOS") != std::string::npos) {
+      found_expected_msg = true;
+      break;
+    }
+#else
     if (log.message.find("Disabled Auto-Exposure Priority") !=
             std::string::npos &&
         log.message.find("color sensor") != std::string::npos) {
-      found_disabled_msg = true;
+      found_expected_msg = true;
       break;
     }
+#endif
   }
-  EXPECT_TRUE(found_disabled_msg)
+#if defined(__APPLE__)
+  EXPECT_TRUE(found_expected_msg)
+      << "Should log that the option was skipped on macOS";
+#else
+  EXPECT_TRUE(found_expected_msg)
       << "Should log 'Disabled Auto-Exposure Priority for color sensor'";
+#endif
 
   // Verify no errors
   auto error_logs = log_capture.get_error_logs();
@@ -1058,6 +1077,18 @@ TEST_F(DeviceTest, DisableAutoExposurePriority_SetOptionFails_LogsWarning) {
   MockSensor mock_sensor;
   mock_sensor.set_sensor_type(true, false); // Color sensor
 
+#if defined(__APPLE__)
+  // macOS skips set_option, so the "set_option throws" path can't be
+  // exercised — verify it's skipped cleanly with no warning instead.
+  EXPECT_CALL(mock_sensor, supports(_)).Times(0);
+  EXPECT_CALL(mock_sensor, set_option(_, _)).Times(0);
+
+  disableAutoExposurePriority(mock_sensor, logger);
+
+  auto warning_logs = log_capture.get_warning_logs();
+  EXPECT_EQ(warning_logs.size(), 0)
+      << "macOS skips set_option, so no warning should be logged";
+#else
   // Setup expectations - sensor supports option but set_option throws
   EXPECT_CALL(mock_sensor, supports(RS2_OPTION_AUTO_EXPOSURE_PRIORITY))
       .WillOnce(Return(true));
@@ -1075,6 +1106,7 @@ TEST_F(DeviceTest, DisableAutoExposurePriority_SetOptionFails_LogsWarning) {
               ::testing::HasSubstr("Failed to disable Auto-Exposure Priority"));
   EXPECT_THAT(warning_logs[0].message,
               ::testing::HasSubstr("Option not supported"));
+#endif
 }
 
 TEST_F(DeviceTest, DisableAutoExposurePriority_UnknownSensorType_LogsError) {
@@ -1217,12 +1249,21 @@ TEST_F(DeviceTest,
   EXPECT_CALL(*color_sensor.mock(),
               set_option(RS2_OPTION_GLOBAL_TIME_ENABLED, 1.0f))
       .Times(1);
+#if defined(__APPLE__)
+  // macOS skips disabling auto-exposure priority (see device_impl.hpp).
+  EXPECT_CALL(*color_sensor.mock(), supports(RS2_OPTION_AUTO_EXPOSURE_PRIORITY))
+      .Times(0);
+  EXPECT_CALL(*color_sensor.mock(),
+              set_option(RS2_OPTION_AUTO_EXPOSURE_PRIORITY, _))
+      .Times(0);
+#else
   EXPECT_CALL(*color_sensor.mock(), supports(RS2_OPTION_AUTO_EXPOSURE_PRIORITY))
       .Times(1)
       .WillOnce(Return(true));
   EXPECT_CALL(*color_sensor.mock(),
               set_option(RS2_OPTION_AUTO_EXPOSURE_PRIORITY, 0.0f))
       .Times(1);
+#endif
 
   // Set expectations for depth sensor:
   // - enableGlobalTimestamp should be called once
@@ -1290,8 +1331,13 @@ TEST_F(DeviceTest,
       << "Should log that global timestamp was enabled for color";
   EXPECT_TRUE(found_depth_global_log)
       << "Should log that global timestamp was enabled for depth";
+#if defined(__APPLE__)
+  EXPECT_FALSE(found_disable_auto_exp_log)
+      << "macOS should skip disabling auto-exposure, not log a disable";
+#else
   EXPECT_TRUE(found_disable_auto_exp_log)
       << "Should log that auto-exposure was disabled for color";
+#endif
   EXPECT_TRUE(found_matching_profiles_log)
       << "Should log that matching profiles were found";
 }

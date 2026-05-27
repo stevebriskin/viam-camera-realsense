@@ -58,6 +58,17 @@ void disableAutoExposurePriority(SensorT &sensor,
     // temporal alignment with depth (causes 5-20ms timestamp drift).
     // Tradeoff: slightly worse exposure in changing light conditions,
     // but tight temporal sync (mostly <5ms) between color and depth.
+#if defined(__APPLE__)
+    // On macOS, set_option(AUTO_EXPOSURE_PRIORITY) before pipe.start() fails
+    // with "failed to set power state" (libusb RS2_USB_STATUS_ACCESS on the
+    // command interface), and the failure leaves the sensor in a state where
+    // the next call (get_stream_profiles) also throws. Skip it on macOS — we
+    // lose the constant-FPS guarantee but the pipeline actually starts.
+    VIAM_DEVICE_LOG(logger, info)
+        << "[disableAutoExposurePriority] Skipped on macOS — "
+           "set_option before pipe.start is unreliable on this platform";
+    return;
+#else
     if (sensor.supports(RS2_OPTION_AUTO_EXPOSURE_PRIORITY)) {
       try {
         // Disable auto-exposure priority to ensure constant FPS
@@ -71,6 +82,7 @@ void disableAutoExposurePriority(SensorT &sensor,
                                       << e.what();
       }
     }
+#endif
   } catch (const std::exception &e) {
     VIAM_DEVICE_LOG(logger, error)
         << "[disableAutoExposurePriority] Failed to get sensor type: "
